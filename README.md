@@ -1,30 +1,36 @@
-# antiphon
 
-Antiphon is a Rust TUI for running two AI agents in a turn-based terminal dialogue. It supports `claude`, `codex`, or a mixed pair, streams tokens live, shows reasoning/tool activity in side panels, and writes audit logs for every run.
+**Antiphon started as an experiment: what happens when two AI agents talk to each other?**
+
+🧬 *Antiphon* grew out of that question. It's a terminal UI that puts two agents in a turn-based dialogue — useful for watching them negotiate a feature, explore a design, or build a fictional world together. 
+
+Presets let you save interesting configurations. 
+
+The agents are coding agents at heart, so they'll want to write code, which makes them surprisingly effective when pointed at a real problem together.
+
+Meet: **💜 Aria** & **🌿 Basil**
+
+*This is v1. Fork it, extend it, use it as a starting point — MIT licensed.*
+
+![Screenshot](assets/antiphon-TUI.png)
 
 > [!CAUTION]
-> CLI agents launched by Antiphon run with full local permissions. They can read files, write files, and execute commands in the working directory without extra confirmation prompts. Use Antiphon only in repositories and with prompts you trust.
-
-## What You Need
-
-- Rust 1.85 or newer: [rustup.rs](https://rustup.rs)
-- At least one agent CLI already installed and authenticated:
-  - [Claude Code CLI](https://claude.ai/code) for `claude`
-  - [OpenAI Codex CLI](https://github.com/openai/codex) for `codex` or `codex-api`
-
-Antiphon installs the TUI itself. It does not install Claude Code or Codex for you.
+> Agents launched by Antiphon run with full local permissions. They can read, write, and execute in the working directory without extra prompts. Only use it in repos and with prompts you trust.
 
 ## Install
 
-If you just want to try Antiphon, install directly from GitHub:
+**Install the binary:**
 
 ```bash
 cargo install --git https://github.com/maxcaspar/antiphon --locked
 ```
 
-That places the `antiphon` binary in Cargo's bin directory, usually `~/.cargo/bin`. Make sure that directory is on your `PATH`.
+Then from anywhere:
 
-To build from source instead:
+```bash
+antiphon
+```
+
+Or to build from source:
 
 ```bash
 git clone https://github.com/maxcaspar/antiphon
@@ -33,182 +39,95 @@ cargo build --release
 ./target/release/antiphon -- "Start."
 ```
 
-## Fastest First Run
+You'll need:
+- Rust 1.85+: [rustup.rs](https://rustup.rs)
+- At least one agent CLI installed and authenticated — [Claude Code](https://claude.ai/code) or [OpenAI Codex](https://github.com/openai/codex)
 
-The simplest setup is Claude on both sides:
+## Usage
+
+Both agents default to Claude:
 
 ```bash
 antiphon -- "Design a rate-limiting strategy for this repo."
 ```
 
-Mixed Claude/Codex session:
+Mixed pair:
 
 ```bash
 antiphon --agent-b codex -- "Review this API design."
 ```
 
-Explicit turn count:
+Explicit turns:
 
 ```bash
 antiphon --agent-a claude --agent-b codex --turns 4 -- "Debate the CAP theorem."
 ```
 
-Non-interactive mode:
-
-```bash
-antiphon --debug --turns 2 -- "Start."
-```
-
-Press `r` in the TUI to launch or relaunch the conversation. If `stdin` or `stdout` is not attached to an interactive terminal, Antiphon automatically falls back to debug mode instead of failing.
-
-## Agent Modes
-
-| Command | Use when | Notes |
-|---|---|---|
-| `claude` | You use Claude Code locally | Default for both agents |
-| `codex` | You use the Codex CLI with its normal login/config | Streams Codex CLI events directly |
-| `codex-api` | You want Codex forced into API-key auth with isolated config | Reads OpenAI settings from `.env` and uses a separate `CODEX_HOME` |
-
-Open the agent chooser with `a` for Aria or `d` for Basil. Use `↑/↓`, `Enter`, and `Esc`.
-
-## Configuration
-
-Antiphon stores runtime data in your platform config directory:
-
-| Platform | Default path |
-|---|---|
-| Linux | `~/.config/antiphon/` |
-| macOS | `~/Library/Application Support/antiphon/` |
-| Windows | `%APPDATA%\\antiphon\\` |
-
-- Override the location with `ANTIPHON_HOME=/your/path`
-- If the platform config directory cannot be created or written, Antiphon falls back to `./.antiphon` in the current working directory
-
-For Claude-only usage, you usually do not need an Antiphon config file if `claude` already works in your shell.
-
-For `codex-api`, create `~/.config/antiphon/.env` or set `ANTIPHON_HOME` and place `.env` there:
-
-```bash
-mkdir -p ~/.config/antiphon
-cat > ~/.config/antiphon/.env <<'EOF'
-OPENAI_API_KEY=your_key_here
-OPENAI_MODEL=gpt-5.4
-OPENAI_REASONING_EFFORT=medium
-OPENAI_VERBOSITY=high
-EOF
-```
-
-See [`.env.example`](./.env.example) for all supported variables, including `OPENAI_BASE_URL`, `CODEX_API_CMD`, and `CODEX_API_CODEX_HOME`.
+Press `r` in the TUI to launch or relaunch. Press `s` to load a preset.
 
 ## TUI Controls
-
-### Setup and Editing
 
 | Key | Action |
 |---|---|
 | `r` | Launch or relaunch |
 | `w` | Edit the briefing prompt |
 | `q` / `e` | Edit Aria / Basil system prompt |
-| `a` / `d` | Open Aria / Basil agent chooser |
-| `1`-`9` | Set turn count directly |
-| `` ` `` | Enter an exact turn count |
+| `a` / `d` | Open agent chooser |
 | `s` | Open preset mode |
-| `?` / `h` | Open or close the help modal |
-
-### During a Run
-
-| Key | Action |
-|---|---|
 | `p` | Pause or resume |
-| `c` | Clear chat panes |
-| `Esc` | Stop the run or back out of the deepest active mode |
+| `Esc` | Stop run or back out |
 | `Ctrl-Q` | Quit |
-
-### View and Navigation
-
-| Key | Action |
-|---|---|
 | `x` | Cycle routing mode |
 | `y` | Toggle layout |
-| `n` | Expand or collapse thinking |
 | `b` | Toggle tmux side panes |
-| `v` | Toggle mouse capture for text selection |
-| `↑/↓`, `j/k`, `PgUp/PgDn` | Scroll |
+| `?` / `h` | Help |
 
-## Routing Modes
+## Agent Modes
 
-| Mode | Behavior |
+| Command | Notes |
 |---|---|
-| `prompt->A` | The initial prompt goes only to Aria; after that, each agent sees the latest reply |
-| `prompt->A+B` | Both agents receive the original prompt on their first turn |
+| `claude` | Claude Code CLI (default) |
+| `codex` | Codex CLI with normal login |
+| `codex-api` | Codex forced into API-key auth — reads from `.env` |
 
-## Layouts
+For `codex-api`, create `~/.config/antiphon/.env`:
 
-Classic mode shows a single conversation pane plus a collapsible thinking rail.
+```bash
+OPENAI_API_KEY=your_key_here
+OPENAI_MODEL=gpt-4o
+```
 
-Tri-pane mode puts Aria's thinking on the left, the conversation in the center, and Basil's thinking on the right. Tool activity and reasoning events remain in arrival order inside each agent's panel.
+See [`.env.example`](./.env.example) for all options.
 
 ## Presets
 
-Press `s` to manage presets. Presets store:
-
-- briefing prompt
-- both agent system prompts
-- turn count
-- routing mode
-- layout and related UI settings
-- selected agent commands
-
-Inside preset mode:
-
-| Key | Action |
-|---|---|
-| `j/k` or `↑/↓` | Move selection |
-| `Enter` | Load selected preset |
-| `Ctrl-S` | Save or update |
-| `Ctrl-D` | Delete |
-| `Esc` | Exit preset mode |
+Press `s` to save or load presets. A preset stores the briefing, both system prompts, turn count, routing mode, layout, and agent selection.
 
 ## Audit Logs
 
-Each run writes logs under `<config-dir>/conversations/conv-<id>/`:
-
-```text
-conversation.jsonl
-agent_a.jsonl
-agent_b.jsonl
-live.log
-agent_a_live.log
-agent_b_live.log
-```
-
-Use `--audit-log <PATH>` if you want the conversation output written somewhere else.
+Each run writes logs to `<config-dir>/conversations/conv-<id>/` — full JSONL transcripts for both agents.
 
 ## CLI Reference
 
 ```text
 antiphon [OPTIONS] [-- <INITIAL_PROMPT>]
 
-Options:
-  --agent-a <AGENT_A>      [default: claude]
-  --agent-b <AGENT_B>      [default: claude]
-  --turns <TURNS>          [default: 10]
+  --agent-a <AGENT>    [default: claude]
+  --agent-b <AGENT>    [default: claude]
+  --turns <N>          [default: 10]
   --debug
-  --output <OUTPUT>        [default: text] [possible values: text, json]
-  --audit-log <AUDIT_LOG>
-  --quiet
-  -h, --help               Print help
-  -V, --version            Print version
+  --audit-log <PATH>
+  -h, --help
+  -V, --version
 ```
 
-## Release Checklist
+## Uninstall
 
-Before telling other people to install Antiphon, confirm:
-
-1. `cargo test`
-2. `cargo build --release`
-3. The README install command points at the correct repository
-4. At least one supported agent CLI (`claude` or `codex`) is installed and works on a clean shell
+```bash
+cargo uninstall antiphon
+rm -rf ~/.config/antiphon        # Linux
+rm -rf ~/Library/Application\ Support/antiphon  # macOS
+```
 
 ## License
 

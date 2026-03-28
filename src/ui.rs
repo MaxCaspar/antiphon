@@ -2752,13 +2752,13 @@ fn agent_model(cmd: &str) -> String {
         std::env::var("CLAUDE_MODEL")
             .ok()
             .filter(|v| !v.trim().is_empty())
-            .unwrap_or_else(|| "\u{2014}".to_string())
+            .unwrap_or_else(|| "claude-sonnet-4-6".to_string())
     } else if cmd == "codex" || cmd == "codex-api" {
         let model = ["OPENAI_MODEL", "CODEX_API_MODEL"]
             .iter()
             .filter_map(|k| std::env::var(k).ok())
             .find(|v| !v.trim().is_empty())
-            .unwrap_or_else(|| "\u{2014}".to_string());
+            .unwrap_or_else(|| "gpt-5.4".to_string());
         if cmd == "codex-api" {
             format!("API: {}", model)
         } else {

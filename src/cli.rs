@@ -35,6 +35,6 @@ pub struct Cli {
     #[arg(long, default_value_t = false)]
     pub quiet: bool,
 
-    #[arg(last = true)]
+#[arg(last = true)]
     pub initial_prompt: Option<String>,
 }

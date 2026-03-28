@@ -2,7 +2,6 @@ target/
 **/*.rs.bk
 conversations/
 /.antiphon/
-.antiphon.tui-settings.json
 .env
 
 # test runner artifacts
