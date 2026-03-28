@@ -22,6 +22,12 @@ use crate::ui::{self, UiAction};
 const UI_SETTINGS_FILE: &str = ".antiphon.tui-settings.json";
 const CONVERSATION_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 
+const DEFAULT_PRESETS_JSON: &str = include_str!("default_presets.json");
+
+fn default_presets() -> Vec<Preset> {
+    serde_json::from_str(DEFAULT_PRESETS_JSON).unwrap_or_default()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Preset {
     pub name: String,
@@ -199,7 +205,7 @@ async fn run_crossterm_mode(args: Cli) -> Result<(), AppError> {
     let mut thinking_expanded = false;
     let mut show_tmux_panels = true;
     let mut agent_system_prompts = [String::new(), String::new()];
-    let mut presets: Vec<Preset> = Vec::new();
+    let mut presets: Vec<Preset> = default_presets();
     let mut active_preset_idx: Option<usize> = None;
     let mut launch_requested = false;
     let mut initial_presets: Vec<Preset> = Vec::new();
@@ -221,7 +227,11 @@ async fn run_crossterm_mode(args: Cli) -> Result<(), AppError> {
         thinking_expanded = saved.thinking_expanded;
         show_tmux_panels = saved.show_tmux_panels;
         agent_system_prompts = [saved.agent_a_system_prompt, saved.agent_b_system_prompt];
-        presets = saved.presets;
+        presets = if saved.presets.is_empty() {
+            default_presets()
+        } else {
+            saved.presets
+        };
         active_preset_idx = saved.active_preset_idx;
         initial_presets = presets.clone();
     }

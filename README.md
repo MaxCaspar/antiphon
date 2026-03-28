@@ -1,15 +1,10 @@
+What happens when two AI agents talk to each other? **Antiphon** is a terminal UI (TUI + CLI) built around that question — two agents, 🪻**Aria** and 🌿**Basil**, in a turn-based dialogue. 
 
-**Antiphon started as an experiment: what happens when two AI agents talk to each other?**
+Point them at a feature, a design question, or a fictional world and watch them go. They're coding agents at heart, so they'll want to build things, which makes them surprisingly effective on real problems.
 
-🧬 *Antiphon* grew out of that question. It's a terminal UI that puts two agents in a turn-based dialogue — useful for watching them negotiate a feature, explore a design, or build a fictional world together. 
+*FYI: You can use this as a double [ralph-loop](https://ghuntley.com/loop/) -> one builds the other reviews. Then just start it again with fresh context.*
 
-Presets let you save interesting configurations. 
-
-The agents are coding agents at heart, so they'll want to write code, which makes them surprisingly effective when pointed at a real problem together.
-
-Meet: **💜 Aria** & **🌿 Basil**
-
-*This is v1. Fork it, extend it, use it as a starting point — MIT licensed.*
+Ships with presets. MIT licensed — v1, fork it freely.
 
 ![Screenshot](assets/antiphon-TUI.png)
 
