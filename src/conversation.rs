@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -191,6 +192,8 @@ pub struct ConversationConfig {
     pub debug: bool,
     pub audit: Option<Arc<AuditSet>>,
     pub agent_system_prompts: [String; 2],
+    pub workspace_root: PathBuf,
+    pub codex_api_home: PathBuf,
 }
 
 pub async fn run(
@@ -204,7 +207,8 @@ pub async fn run(
             "turns": cfg.turns,
             "routing_mode": cfg.routing_mode.as_str(),
             "agent_a": cfg.agents[0].cmd,
-            "agent_b": cfg.agents[1].cmd
+            "agent_b": cfg.agents[1].cmd,
+            "workspace_root": cfg.workspace_root,
         }));
         audit.live_line(&format!(
             "[run.start] turns={} routing_mode={} agent_a={} agent_b={}",
@@ -281,6 +285,8 @@ pub async fn run(
             &prompt,
             cfg.debug,
             &mut sessions[agent_idx],
+            &cfg.workspace_root,
+            &cfg.codex_api_home,
             |line, thinking, tool_events| {
                 if let Some(audit) = &audit_for_raw {
                     audit.live_line(&format!("[raw][{}] {}", agent_name_now, line));

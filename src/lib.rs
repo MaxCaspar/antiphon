@@ -7,6 +7,7 @@ pub mod error;
 pub mod output;
 pub mod tmux;
 pub mod ui;
+pub mod workspace;
 
 use std::path::PathBuf;
 

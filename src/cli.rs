@@ -32,9 +32,12 @@ pub struct Cli {
     #[arg(long)]
     pub audit_log: Option<PathBuf>,
 
+    #[arg(long)]
+    pub workspace: Option<PathBuf>,
+
     #[arg(long, default_value_t = false)]
     pub quiet: bool,
 
-#[arg(last = true)]
+    #[arg(last = true)]
     pub initial_prompt: Option<String>,
 }

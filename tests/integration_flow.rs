@@ -75,6 +75,31 @@ fn subprocess_failure_path() {
     .stdout(predicate::str::contains("\"code\": \"non_zero_exit\""));
 }
 
+#[test]
+fn debug_workspace_flag_sets_agent_cwd() {
+    let workspace = std::env::temp_dir().join(format!(
+        "antiphon-workspace-cli-test-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&workspace).expect("workspace");
+
+    let mut cmd = Command::cargo_bin("antiphon").expect("binary exists");
+    cmd.args([
+        "--debug",
+        "--workspace",
+        workspace.to_str().expect("utf8 path"),
+        "--turns",
+        "1",
+        "--agent-a",
+        &fixture("mock_pwd.sh"),
+        "--",
+        "start",
+    ])
+    .assert()
+    .success()
+    .stdout(predicate::str::contains(workspace.display().to_string()));
+}
+
 #[tokio::test]
 async fn codex_reasoning_events_emit_thinking_without_duplicates() {
     let cfg = ConversationConfig {
@@ -92,6 +117,8 @@ async fn codex_reasoning_events_emit_thinking_without_duplicates() {
         debug: true,
         audit: None,
         agent_system_prompts: [String::new(), String::new()],
+        workspace_root: std::env::current_dir().expect("cwd"),
+        codex_api_home: std::env::temp_dir().join("antiphon-test-codex-home"),
     };
 
     let (events_tx, mut events_rx) = mpsc::channel(128);
@@ -149,6 +176,47 @@ async fn codex_reasoning_events_emit_thinking_without_duplicates() {
 }
 
 #[tokio::test]
+async fn conversation_uses_workspace_root_as_subprocess_cwd() {
+    let workspace = std::env::temp_dir().join(format!(
+        "antiphon-conversation-cwd-test-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&workspace).expect("workspace");
+
+    let cfg = ConversationConfig {
+        agents: [
+            AgentSpec {
+                cmd: fixture("mock_pwd.sh"),
+            },
+            AgentSpec {
+                cmd: fixture("mock_codex.sh"),
+            },
+        ],
+        turns: 1,
+        initial_prompt: "start".to_string(),
+        routing_mode: RoutingMode::PromptOnlyToAgentA,
+        debug: true,
+        audit: None,
+        agent_system_prompts: [String::new(), String::new()],
+        workspace_root: workspace.clone(),
+        codex_api_home: std::env::temp_dir().join("antiphon-test-codex-home"),
+    };
+
+    let (events_tx, _events_rx) = mpsc::channel(128);
+    let (_control_tx, control_rx) = watch::channel(ConversationControl::Run);
+    let transcript = conversation::run(cfg, events_tx, control_rx)
+        .await
+        .expect("conversation run should succeed");
+
+    assert!(
+        transcript
+            .render()
+            .contains(workspace.to_str().expect("utf8 path")),
+        "agent subprocess should run inside the configured workspace root"
+    );
+}
+
+#[tokio::test]
 async fn codex_multiple_agent_messages_are_separated_by_blank_line() {
     let cfg = ConversationConfig {
         agents: [
@@ -165,6 +233,8 @@ async fn codex_multiple_agent_messages_are_separated_by_blank_line() {
         debug: true,
         audit: None,
         agent_system_prompts: [String::new(), String::new()],
+        workspace_root: std::env::current_dir().expect("cwd"),
+        codex_api_home: std::env::temp_dir().join("antiphon-test-codex-home"),
     };
 
     let (events_tx, _events_rx) = mpsc::channel(128);
@@ -198,6 +268,8 @@ async fn codex_tool_events_emit_once_per_stream_line_after_single_pass_decode() 
         debug: true,
         audit: None,
         agent_system_prompts: [String::new(), String::new()],
+        workspace_root: std::env::current_dir().expect("cwd"),
+        codex_api_home: std::env::temp_dir().join("antiphon-test-codex-home"),
     };
 
     let (events_tx, mut events_rx) = mpsc::channel(128);
@@ -251,6 +323,8 @@ async fn codex_interleaved_reasoning_and_tool_events_preserve_order_without_dupl
         debug: true,
         audit: None,
         agent_system_prompts: [String::new(), String::new()],
+        workspace_root: std::env::current_dir().expect("cwd"),
+        codex_api_home: std::env::temp_dir().join("antiphon-test-codex-home"),
     };
 
     let (events_tx, mut events_rx) = mpsc::channel(128);

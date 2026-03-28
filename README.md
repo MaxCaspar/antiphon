@@ -60,6 +60,8 @@ antiphon --agent-a claude --agent-b codex --turns 4 -- "Debate the CAP theorem."
 
 Press `r` in the TUI to launch or relaunch. Press `s` to load a preset.
 
+Use `g` inside the TUI to switch the active repo without restarting the app. The cockpit reloads immediately, but agent subprocesses only move to the new repo on the next launch or relaunch.
+
 ## TUI Controls
 
 | Key | Action |
@@ -69,6 +71,7 @@ Press `r` in the TUI to launch or relaunch. Press `s` to load a preset.
 | `q` / `e` | Edit Aria / Basil system prompt |
 | `a` / `d` | Open agent chooser |
 | `s` | Open preset mode |
+| `g` | Open workspace panel |
 | `p` | Pause or resume |
 | `Esc` | Stop run or back out |
 | `Ctrl-Q` | Quit |
@@ -76,6 +79,26 @@ Press `r` in the TUI to launch or relaunch. Press `s` to load a preset.
 | `y` | Toggle layout |
 | `b` | Toggle tmux side panes |
 | `?` / `h` | Help |
+
+## Workspaces
+
+Antiphon keeps an explicit active workspace instead of assuming the process cwd forever.
+
+- `g` opens the workspace panel.
+- The status area shows the current repo and whether its cockpit persistence is `global` or `repo`.
+- Switching repos reloads the visible cockpit immediately.
+- If a run is already active, the new repo applies on the next relaunch only.
+
+Each repo can use one of two persistence scopes:
+
+- `global`: settings and conversations stay under the Antiphon runtime home
+- `repo`: settings and conversations live under `<repo>/.antiphon/`
+
+You can also start directly in a repo from the CLI:
+
+```bash
+antiphon --workspace /abs/path/to/repo -- "Review the latest API changes."
+```
 
 ## Agent Modes
 
@@ -100,7 +123,10 @@ Press `s` to save or load presets. A preset stores the briefing, both system pro
 
 ## Audit Logs
 
-Each run writes logs to `<config-dir>/conversations/conv-<id>/` — full JSONL transcripts for both agents.
+Each run writes logs under the active workspace scope:
+
+- `global` scope: `<config-dir>/antiphon/conversations/conv-<id>/`
+- `repo` scope: `<repo>/.antiphon/conversations/conv-<id>/`
 
 ## CLI Reference
 
@@ -112,6 +138,7 @@ antiphon [OPTIONS] [-- <INITIAL_PROMPT>]
   --turns <N>          [default: 10]
   --debug
   --audit-log <PATH>
+  --workspace <PATH>
   -h, --help
   -V, --version
 ```

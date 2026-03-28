@@ -2,6 +2,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use std::io::IsTerminal;
+use std::path::{Path, PathBuf};
 use std::{fs, io};
 
 use serde::{Deserialize, Serialize};
@@ -18,8 +19,11 @@ use crate::conversation::{
 use crate::error::AppError;
 use crate::tmux;
 use crate::ui::{self, UiAction};
+use crate::workspace::{
+    RuntimePaths, ScopeResolution, SettingsScope, WorkspacePaths, WorkspaceRegistry,
+    bootstrap_settings_file, initial_workspace_root, resolve_scope,
+};
 
-const UI_SETTINGS_FILE: &str = ".antiphon.tui-settings.json";
 const CONVERSATION_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 
 const DEFAULT_PRESETS_JSON: &str = include_str!("default_presets.json");
@@ -37,50 +41,148 @@ pub struct Preset {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct UiSettings {
-    prompt: String,
-    agent_a: String,
-    agent_b: String,
-    turns: usize,
-    routing_mode: RoutingMode,
-    tri_pane_layout: bool,
+pub(crate) struct UiSettings {
+    pub(crate) prompt: String,
+    pub(crate) agent_a: String,
+    pub(crate) agent_b: String,
+    pub(crate) turns: usize,
+    pub(crate) routing_mode: RoutingMode,
+    pub(crate) tri_pane_layout: bool,
     #[serde(default)]
-    orb_layout: bool,
-    thinking_expanded: bool,
-    show_tmux_panels: bool,
+    pub(crate) orb_layout: bool,
+    pub(crate) thinking_expanded: bool,
+    pub(crate) show_tmux_panels: bool,
     #[serde(default)]
-    agent_a_system_prompt: String,
+    pub(crate) agent_a_system_prompt: String,
     #[serde(default)]
-    agent_b_system_prompt: String,
+    pub(crate) agent_b_system_prompt: String,
     #[serde(default)]
-    presets: Vec<Preset>,
+    pub(crate) presets: Vec<Preset>,
     #[serde(default)]
-    active_preset_idx: Option<usize>,
+    pub(crate) active_preset_idx: Option<usize>,
 }
 
-fn settings_path() -> std::path::PathBuf {
-    std::env::current_dir()
-        .unwrap_or_else(|_| crate::home_dir())
-        .join(UI_SETTINGS_FILE)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppWorkspaceState {
+    pub active_workspace_root: PathBuf,
+    pub active_scope: SettingsScope,
+    pub active_paths: WorkspacePaths,
+    pub launch_workspace_root: Option<PathBuf>,
+    pub launch_scope: Option<SettingsScope>,
 }
 
-fn load_ui_settings() -> Option<UiSettings> {
-    let raw = fs::read_to_string(settings_path()).ok()?;
+impl AppWorkspaceState {
+    fn relaunch_required(&self) -> bool {
+        self.launch_workspace_root
+            .as_ref()
+            .zip(self.launch_scope)
+            .is_some_and(|(root, scope)| {
+                root != &self.active_workspace_root || scope != self.active_scope
+            })
+    }
+}
+
+pub(crate) fn default_ui_settings() -> UiSettings {
+    UiSettings {
+        prompt: String::new(),
+        agent_a: "claude".to_string(),
+        agent_b: "claude".to_string(),
+        turns: 10,
+        routing_mode: RoutingMode::PromptOnlyToAgentA,
+        tri_pane_layout: false,
+        orb_layout: false,
+        thinking_expanded: false,
+        show_tmux_panels: true,
+        agent_a_system_prompt: String::new(),
+        agent_b_system_prompt: String::new(),
+        presets: default_presets(),
+        active_preset_idx: None,
+    }
+}
+
+pub(crate) fn serialize_ui_settings(settings: &UiSettings) -> io::Result<String> {
+    serde_json::to_string_pretty(settings)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))
+}
+
+pub(crate) fn load_ui_settings(path: &Path) -> Option<UiSettings> {
+    let raw = fs::read_to_string(path).ok()?;
     serde_json::from_str::<UiSettings>(&raw).ok()
 }
 
-fn save_ui_settings(settings: &UiSettings, presets_modified: bool) -> io::Result<()> {
+pub(crate) fn load_ui_settings_or_default(path: &Path) -> UiSettings {
+    load_ui_settings(path).unwrap_or_else(default_ui_settings)
+}
+
+pub(crate) fn save_ui_settings(
+    path: &Path,
+    settings: &UiSettings,
+    presets_modified: bool,
+) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
     // If the TUI didn't modify presets, re-read them from disk so manual edits survive.
     let mut to_save = settings.clone();
     if !presets_modified {
-        if let Some(disk) = load_ui_settings() {
+        if let Some(disk) = load_ui_settings(path) {
             to_save.presets = disk.presets;
             to_save.active_preset_idx = disk.active_preset_idx;
         }
     }
-    let payload = serde_json::to_string_pretty(&to_save)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-    fs::write(settings_path(), payload)
+    let payload = serialize_ui_settings(&to_save)?;
+    fs::write(path, payload)
+}
+
+fn resolve_initial_workspace_state(
+    args: &Cli,
+) -> Result<(RuntimePaths, WorkspaceRegistry, AppWorkspaceState), AppError> {
+    let runtime_paths = RuntimePaths::new(crate::home_dir());
+    fs::create_dir_all(&runtime_paths.runtime_home)?;
+    fs::create_dir_all(&runtime_paths.global_conversations_dir)?;
+    fs::create_dir_all(&runtime_paths.codex_api_home)?;
+
+    let mut registry =
+        WorkspaceRegistry::load(&runtime_paths.workspace_registry_path).unwrap_or_default();
+    let initial_root = if let Some(path) = args.workspace.as_deref() {
+        crate::workspace::normalize_workspace_path(&path.display().to_string())
+            .map_err(|err| AppError::InvalidInput(err.to_string()))?
+    } else {
+        initial_workspace_root(None, &registry)
+    };
+    if !initial_root.is_dir() {
+        return Err(AppError::InvalidInput(format!(
+            "workspace path is not a directory: {}",
+            initial_root.display()
+        )));
+    }
+
+    let initial_scope = match resolve_scope(&registry, &initial_root) {
+        ScopeResolution::Resolved(scope) => scope,
+        ScopeResolution::NeedsChoice { .. } => SettingsScope::Global,
+    };
+    let active_paths =
+        WorkspacePaths::for_workspace(&runtime_paths, initial_root.clone(), initial_scope);
+    bootstrap_settings_file(
+        &active_paths,
+        None,
+        &serialize_ui_settings(&default_ui_settings())?,
+    )?;
+    registry.remember_workspace(&initial_root);
+    registry.set_preference(&initial_root, initial_scope);
+    registry.save(&runtime_paths.workspace_registry_path)?;
+
+    Ok((
+        runtime_paths,
+        registry,
+        AppWorkspaceState {
+            active_workspace_root: initial_root,
+            active_scope: initial_scope,
+            active_paths,
+            launch_workspace_root: None,
+            launch_scope: None,
+        },
+    ))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -155,11 +257,12 @@ pub async fn run(args: Cli) -> Result<(), AppError> {
 
 async fn run_crossterm_mode(args: Cli) -> Result<(), AppError> {
     let debug_mode = args.debug || !is_interactive();
-
+    let (runtime_paths, _registry, mut workspace_state) = resolve_initial_workspace_state(&args)?;
+    let settings_path = workspace_state.active_paths.settings_path.clone();
     let audit_base_dir = args
         .audit_log
         .clone()
-        .unwrap_or_else(|| crate::home_dir().join("conversations"));
+        .unwrap_or_else(|| workspace_state.active_paths.conversations_dir.clone());
 
     if debug_mode {
         let audit = Arc::new(AuditSet::create(&audit_base_dir)?);
@@ -178,6 +281,8 @@ async fn run_crossterm_mode(args: Cli) -> Result<(), AppError> {
             debug: true,
             audit: Some(audit),
             agent_system_prompts: [String::new(), String::new()],
+            workspace_root: workspace_state.active_workspace_root.clone(),
+            codex_api_home: runtime_paths.codex_api_home.clone(),
         };
         let (events_tx, events_rx) = mpsc::channel(512);
         let (_control_tx, control_rx) = watch::channel(ConversationControl::Run);
@@ -190,7 +295,7 @@ async fn run_crossterm_mode(args: Cli) -> Result<(), AppError> {
         return Ok(());
     }
 
-    let loaded = load_ui_settings();
+    let loaded = load_ui_settings(&settings_path);
     let mut prompt = args.initial_prompt.unwrap_or_else(|| {
         loaded
             .as_ref()
@@ -244,7 +349,15 @@ async fn run_crossterm_mode(args: Cli) -> Result<(), AppError> {
             drop(events_tx);
             None
         } else {
-            let audit = Arc::new(AuditSet::create(&audit_base_dir)?);
+            let launch_workspace_root = workspace_state.active_workspace_root.clone();
+            let launch_scope = workspace_state.active_scope;
+            workspace_state.launch_workspace_root = Some(launch_workspace_root.clone());
+            workspace_state.launch_scope = Some(launch_scope);
+            let scoped_audit_dir = args
+                .audit_log
+                .clone()
+                .unwrap_or_else(|| workspace_state.active_paths.conversations_dir.clone());
+            let audit = Arc::new(AuditSet::create(&scoped_audit_dir)?);
             if show_tmux_panels {
                 match tmux::open_agent_windows(
                     &audit.conversation_id,
@@ -270,6 +383,8 @@ async fn run_crossterm_mode(args: Cli) -> Result<(), AppError> {
                 debug: false,
                 audit: Some(audit.clone()),
                 agent_system_prompts: agent_system_prompts.clone(),
+                workspace_root: launch_workspace_root,
+                codex_api_home: runtime_paths.codex_api_home.clone(),
             };
             Some(tokio::spawn(conversation::run(cfg, events_tx, control_rx)))
         };
@@ -287,6 +402,12 @@ async fn run_crossterm_mode(args: Cli) -> Result<(), AppError> {
             agent_system_prompts.clone(),
             presets.clone(),
             active_preset_idx,
+            workspace_state.active_workspace_root.clone(),
+            workspace_state.active_scope,
+            workspace_state.relaunch_required(),
+            workspace_state.launch_workspace_root.clone(),
+            workspace_state.launch_scope,
+            runtime_paths.clone(),
         )
         .await;
 
@@ -304,23 +425,34 @@ async fn run_crossterm_mode(args: Cli) -> Result<(), AppError> {
                 agent_system_prompts: next_agent_system_prompts,
                 presets: next_presets,
                 active_preset_idx: next_active_preset_idx,
+                workspace_root: next_workspace_root,
+                settings_scope: next_settings_scope,
             }) => {
+                workspace_state.active_workspace_root = next_workspace_root.clone();
+                workspace_state.active_scope = next_settings_scope;
+                workspace_state.active_paths = WorkspacePaths::for_workspace(
+                    &runtime_paths,
+                    next_workspace_root.clone(),
+                    next_settings_scope,
+                );
+                let quit_settings = UiSettings {
+                    prompt: next_prompt,
+                    agent_a,
+                    agent_b,
+                    turns: next_turns.max(1),
+                    routing_mode: next_routing_mode,
+                    tri_pane_layout: next_tri_pane_layout,
+                    orb_layout: next_orb_layout,
+                    thinking_expanded: next_thinking_expanded,
+                    show_tmux_panels: next_show_tmux_panels,
+                    agent_a_system_prompt: next_agent_system_prompts[0].clone(),
+                    agent_b_system_prompt: next_agent_system_prompts[1].clone(),
+                    presets: next_presets.clone(),
+                    active_preset_idx: next_active_preset_idx,
+                };
                 let _ = save_ui_settings(
-                    &UiSettings {
-                        prompt: next_prompt,
-                        agent_a,
-                        agent_b,
-                        turns: next_turns.max(1),
-                        routing_mode: next_routing_mode,
-                        tri_pane_layout: next_tri_pane_layout,
-                        orb_layout: next_orb_layout,
-                        thinking_expanded: next_thinking_expanded,
-                        show_tmux_panels: next_show_tmux_panels,
-                        agent_a_system_prompt: next_agent_system_prompts[0].clone(),
-                        agent_b_system_prompt: next_agent_system_prompts[1].clone(),
-                        presets: next_presets.clone(),
-                        active_preset_idx: next_active_preset_idx,
-                    },
+                    &workspace_state.active_paths.settings_path,
+                    &quit_settings,
                     next_presets != initial_presets,
                 );
                 let _ = control_tx.send(ConversationControl::Stop);
@@ -349,23 +481,34 @@ async fn run_crossterm_mode(args: Cli) -> Result<(), AppError> {
                 agent_system_prompts: next_agent_system_prompts,
                 presets: next_presets,
                 active_preset_idx: next_active_preset_idx,
+                workspace_root: next_workspace_root,
+                settings_scope: next_settings_scope,
             }) => {
+                workspace_state.active_workspace_root = next_workspace_root.clone();
+                workspace_state.active_scope = next_settings_scope;
+                workspace_state.active_paths = WorkspacePaths::for_workspace(
+                    &runtime_paths,
+                    next_workspace_root.clone(),
+                    next_settings_scope,
+                );
+                let relaunch_settings = UiSettings {
+                    prompt: next_prompt.clone(),
+                    agent_a: agent_a.clone(),
+                    agent_b: agent_b.clone(),
+                    turns: next_turns.max(1),
+                    routing_mode: next_routing_mode,
+                    tri_pane_layout: next_tri_pane_layout,
+                    orb_layout: next_orb_layout,
+                    thinking_expanded: next_thinking_expanded,
+                    show_tmux_panels: next_show_tmux_panels,
+                    agent_a_system_prompt: next_agent_system_prompts[0].clone(),
+                    agent_b_system_prompt: next_agent_system_prompts[1].clone(),
+                    presets: next_presets.clone(),
+                    active_preset_idx: next_active_preset_idx,
+                };
                 let _ = save_ui_settings(
-                    &UiSettings {
-                        prompt: next_prompt.clone(),
-                        agent_a: agent_a.clone(),
-                        agent_b: agent_b.clone(),
-                        turns: next_turns.max(1),
-                        routing_mode: next_routing_mode,
-                        tri_pane_layout: next_tri_pane_layout,
-                        orb_layout: next_orb_layout,
-                        thinking_expanded: next_thinking_expanded,
-                        show_tmux_panels: next_show_tmux_panels,
-                        agent_a_system_prompt: next_agent_system_prompts[0].clone(),
-                        agent_b_system_prompt: next_agent_system_prompts[1].clone(),
-                        presets: next_presets.clone(),
-                        active_preset_idx: next_active_preset_idx,
-                    },
+                    &workspace_state.active_paths.settings_path,
+                    &relaunch_settings,
                     next_presets != initial_presets,
                 );
                 let _ = control_tx.send(ConversationControl::Stop);
@@ -481,6 +624,7 @@ mod tests {
             debug: false,
             output: crate::cli::OutputFormat::Text,
             audit_log: None,
+            workspace: None,
             quiet: false,
             initial_prompt: Some("Start".into()),
         };

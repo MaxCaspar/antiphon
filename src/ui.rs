@@ -1,4 +1,5 @@
-use std::io::{Write, stderr};
+use std::io::{self, Write, stderr};
+use std::path::PathBuf;
 use std::time::Duration;
 
 use crossterm::cursor::{Hide, MoveTo, Show};
@@ -17,10 +18,17 @@ use tokio::sync::{mpsc, watch};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::agent::ToolStreamEventKind;
-use crate::app::Preset;
-use crate::app::WorkingTracker;
+use crate::app::{
+    Preset, UiSettings, WorkingTracker, default_ui_settings, load_ui_settings_or_default,
+    save_ui_settings, serialize_ui_settings,
+};
 use crate::conversation::{self, ConversationControl, ConversationEvent, RoutingMode};
 use crate::error::AppError;
+use crate::workspace::{
+    RuntimePaths, ScopeResolution, SettingsScope, WorkspacePaths, WorkspaceRegistry,
+    bootstrap_settings_file, closest_workspace_suggestions, import_legacy_repo_settings,
+    normalize_workspace_path, resolve_scope,
+};
 
 const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 const SYSPROMPT_HEIGHT: usize = 10;
@@ -59,6 +67,60 @@ enum ModalState {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkspaceFocus {
+    Input,
+    Actions,
+    List,
+}
+
+#[derive(Debug, Clone)]
+enum WorkspacePendingOperation {
+    SwitchRepo {
+        workspace_root: PathBuf,
+        target_scope: SettingsScope,
+        import_legacy: bool,
+    },
+    ToggleScope {
+        workspace_root: PathBuf,
+        target_scope: SettingsScope,
+    },
+}
+
+#[derive(Debug, Clone)]
+struct WorkspaceChoiceState {
+    workspace_root: PathBuf,
+    has_legacy_repo_settings: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkspaceActionRow {
+    SwitchTypedPath,
+    UseGlobalCurrent,
+    EnableRepoCurrent,
+    UseGlobalChoice,
+    CreateRepoChoice,
+    ImportLegacyChoice,
+    SaveAndSwitch,
+    DiscardAndSwitch,
+    CancelPending,
+}
+
+#[derive(Debug, Clone)]
+struct WorkspacePanelState {
+    open: bool,
+    focus: WorkspaceFocus,
+    input: String,
+    cursor: usize,
+    action_cursor: usize,
+    list_cursor: usize,
+    message: Option<String>,
+    suggestions: Vec<PathBuf>,
+    choice_state: Option<WorkspaceChoiceState>,
+    dirty_confirm: Option<WorkspacePendingOperation>,
+    recent_workspaces: Vec<PathBuf>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CommandActionId {
     Relaunch,
     PauseResume,
@@ -94,6 +156,8 @@ pub enum UiAction {
         agent_system_prompts: [String; 2],
         presets: Vec<Preset>,
         active_preset_idx: Option<usize>,
+        workspace_root: PathBuf,
+        settings_scope: SettingsScope,
     },
     Relaunch {
         prompt: String,
@@ -108,6 +172,8 @@ pub enum UiAction {
         agent_system_prompts: [String; 2],
         presets: Vec<Preset>,
         active_preset_idx: Option<usize>,
+        workspace_root: PathBuf,
+        settings_scope: SettingsScope,
     },
 }
 
@@ -191,6 +257,12 @@ pub async fn run_tui(
     initial_agent_system_prompts: [String; 2],
     initial_presets: Vec<Preset>,
     initial_active_preset_idx: Option<usize>,
+    initial_workspace_root: PathBuf,
+    initial_scope: SettingsScope,
+    relaunch_required: bool,
+    initial_launch_workspace_root: Option<PathBuf>,
+    initial_launch_scope: Option<SettingsScope>,
+    runtime_paths: RuntimePaths,
 ) -> Result<UiAction, AppError> {
     let mut term = stderr();
     enable_raw_mode()?;
@@ -214,6 +286,12 @@ pub async fn run_tui(
         initial_agent_system_prompts,
         initial_presets,
         initial_active_preset_idx,
+        initial_workspace_root,
+        initial_scope,
+        relaunch_required,
+        initial_launch_workspace_root,
+        initial_launch_scope,
+        runtime_paths,
     );
     state.render(&mut term)?;
 
@@ -279,7 +357,8 @@ pub async fn run_tui(
                 // Skip re-render while a modal/overlay is open — nothing
                 // animates behind it and the constant redraws cause visible flicker.
                 let modal_open = state.preset_mode_active()
-                    || state.modal_state == ModalState::Help;
+                    || state.modal_state == ModalState::Help
+                    || state.workspace_panel.open;
                 if !modal_open {
                     state.render(&mut term)?;
                 }
@@ -428,6 +507,37 @@ fn handle_key_event(
                 return None;
             }
 
+            if state.workspace_panel.open {
+                match code {
+                    KeyCode::Esc => state.close_workspace_panel(),
+                    KeyCode::Tab => state.workspace_focus_next(),
+                    KeyCode::Up | KeyCode::Char('k') => state.workspace_cursor_up(),
+                    KeyCode::Down | KeyCode::Char('j') => state.workspace_cursor_down(),
+                    KeyCode::Enter => match state.workspace_panel.focus {
+                        WorkspaceFocus::Input => state.execute_workspace_action(),
+                        WorkspaceFocus::Actions => state.execute_workspace_action(),
+                        WorkspaceFocus::List => state.workspace_select_list_entry(),
+                    },
+                    KeyCode::Backspace if state.workspace_panel.focus == WorkspaceFocus::Input => {
+                        state.workspace_backspace();
+                    }
+                    KeyCode::Left if state.workspace_panel.focus == WorkspaceFocus::Input => {
+                        state.workspace_move_left();
+                    }
+                    KeyCode::Right if state.workspace_panel.focus == WorkspaceFocus::Input => {
+                        state.workspace_move_right();
+                    }
+                    KeyCode::Char(c)
+                        if state.workspace_panel.focus == WorkspaceFocus::Input
+                            && (modifiers.is_empty() || modifiers == KeyModifiers::SHIFT) =>
+                    {
+                        state.workspace_insert_char(c);
+                    }
+                    _ => {}
+                }
+                return None;
+            }
+
             match code {
                 KeyCode::Char('?') | KeyCode::Char('h') => {
                     return state.execute_command_action(CommandActionId::Help, control_tx);
@@ -495,6 +605,9 @@ fn handle_key_event(
                 }
                 (KeyCode::Char('s'), modifiers) if modifiers.is_empty() => {
                     return state.execute_command_action(CommandActionId::PresetMode, control_tx);
+                }
+                (KeyCode::Char('g'), modifiers) if modifiers.is_empty() => {
+                    state.open_workspace_panel();
                 }
                 (KeyCode::Char('`'), _) => {
                     return state.execute_command_action(CommandActionId::EditTurns, control_tx);
@@ -721,6 +834,15 @@ struct UiState {
     presets: Vec<Preset>,
     active_preset_idx: Option<usize>,
     preset_panel_state: PresetPanelState,
+    workspace_root: PathBuf,
+    settings_scope: SettingsScope,
+    relaunch_required: bool,
+    launch_workspace_root: Option<PathBuf>,
+    launch_scope: Option<SettingsScope>,
+    runtime_paths: RuntimePaths,
+    workspace_panel: WorkspacePanelState,
+    persisted_snapshot: String,
+    overlay_was_open: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -765,8 +887,14 @@ impl UiState {
         agent_system_prompts: [String; 2],
         initial_presets: Vec<Preset>,
         initial_active_preset_idx: Option<usize>,
+        initial_workspace_root: PathBuf,
+        initial_scope: SettingsScope,
+        relaunch_required: bool,
+        initial_launch_workspace_root: Option<PathBuf>,
+        initial_launch_scope: Option<SettingsScope>,
+        runtime_paths: RuntimePaths,
     ) -> Self {
-        Self {
+        let mut state = Self {
             working: WorkingTracker::new(),
             active_agent: None,
             spinner_frame: 0,
@@ -814,7 +942,33 @@ impl UiState {
             presets: initial_presets,
             active_preset_idx: initial_active_preset_idx,
             preset_panel_state: PresetPanelState::Idle,
-        }
+            workspace_root: initial_workspace_root.clone(),
+            settings_scope: initial_scope,
+            relaunch_required,
+            launch_workspace_root: initial_launch_workspace_root,
+            launch_scope: initial_launch_scope,
+            runtime_paths,
+            workspace_panel: WorkspacePanelState {
+                open: false,
+                focus: WorkspaceFocus::Input,
+                input: initial_workspace_root.display().to_string(),
+                cursor: initial_workspace_root.display().to_string().chars().count(),
+                action_cursor: 0,
+                list_cursor: 0,
+                message: None,
+                suggestions: Vec::new(),
+                choice_state: None,
+                dirty_confirm: None,
+                recent_workspaces: Vec::new(),
+            },
+            persisted_snapshot: String::new(),
+            overlay_was_open: false,
+        };
+        state.refresh_workspace_registry();
+        state.persisted_snapshot = state
+            .current_ui_settings_json()
+            .unwrap_or_else(|_| String::new());
+        state
     }
 
     fn apply_conversation_event(&mut self, event: ConversationEvent) {
@@ -1394,6 +1548,449 @@ impl UiState {
             .to_string();
     }
 
+    fn current_ui_settings(&self) -> UiSettings {
+        UiSettings {
+            prompt: self.prompt.clone(),
+            agent_a: self.agent_cmds[0].clone(),
+            agent_b: self.agent_cmds[1].clone(),
+            turns: self.turns.max(1),
+            routing_mode: self.routing_mode,
+            tri_pane_layout: self.layout_mode == LayoutMode::TriPaneThinking,
+            orb_layout: self.layout_mode == LayoutMode::Orb,
+            thinking_expanded: self.thinking_expanded,
+            show_tmux_panels: self.show_tmux_panels,
+            agent_a_system_prompt: self.agent_system_prompts[0].clone(),
+            agent_b_system_prompt: self.agent_system_prompts[1].clone(),
+            presets: self.presets.clone(),
+            active_preset_idx: self.active_preset_idx,
+        }
+    }
+
+    fn current_ui_settings_json(&self) -> io::Result<String> {
+        serialize_ui_settings(&self.current_ui_settings())
+    }
+
+    fn active_workspace_paths(&self) -> WorkspacePaths {
+        WorkspacePaths::for_workspace(
+            &self.runtime_paths,
+            self.workspace_root.clone(),
+            self.settings_scope,
+        )
+    }
+
+    fn is_dirty(&self) -> bool {
+        self.current_ui_settings_json()
+            .map(|current| current != self.persisted_snapshot)
+            .unwrap_or(false)
+    }
+
+    fn refresh_workspace_registry(&mut self) {
+        let registry = WorkspaceRegistry::load(&self.runtime_paths.workspace_registry_path)
+            .unwrap_or_default();
+        self.workspace_panel.recent_workspaces = registry.recent_workspaces;
+    }
+
+    fn persist_current_workspace_state(&mut self, preserve_disk_presets: bool) -> io::Result<()> {
+        let paths = self.active_workspace_paths();
+        save_ui_settings(
+            &paths.settings_path,
+            &self.current_ui_settings(),
+            !preserve_disk_presets,
+        )?;
+        self.persisted_snapshot = self.current_ui_settings_json()?;
+        Ok(())
+    }
+
+    fn load_workspace_state(&mut self, workspace_root: PathBuf, scope: SettingsScope) {
+        let paths =
+            WorkspacePaths::for_workspace(&self.runtime_paths, workspace_root.clone(), scope);
+        let loaded = load_ui_settings_or_default(&paths.settings_path);
+        self.prompt = loaded.prompt;
+        self.agent_cmds = [loaded.agent_a, loaded.agent_b];
+        self.turns = loaded.turns.max(1);
+        self.routing_mode = loaded.routing_mode;
+        self.layout_mode = if loaded.orb_layout {
+            LayoutMode::Orb
+        } else if loaded.tri_pane_layout {
+            LayoutMode::TriPaneThinking
+        } else {
+            LayoutMode::Classic
+        };
+        self.thinking_expanded = loaded.thinking_expanded;
+        self.show_tmux_panels = loaded.show_tmux_panels;
+        self.agent_system_prompts = [loaded.agent_a_system_prompt, loaded.agent_b_system_prompt];
+        self.presets = if loaded.presets.is_empty() {
+            default_ui_settings().presets
+        } else {
+            loaded.presets
+        };
+        self.active_preset_idx = loaded.active_preset_idx;
+        self.workspace_root = workspace_root;
+        self.settings_scope = scope;
+        self.persisted_snapshot = self.current_ui_settings_json().unwrap_or_default();
+        self.relaunch_required = self
+            .launch_workspace_root
+            .as_ref()
+            .zip(self.launch_scope)
+            .is_some_and(|(launch_root, launch_scope)| {
+                launch_root != &self.workspace_root || launch_scope != self.settings_scope
+            });
+    }
+
+    fn open_workspace_panel(&mut self) {
+        self.refresh_workspace_registry();
+        let input = self.workspace_root.display().to_string();
+        self.workspace_panel.open = true;
+        self.workspace_panel.focus = WorkspaceFocus::Input;
+        self.workspace_panel.input = input.clone();
+        self.workspace_panel.cursor = input.chars().count();
+        self.workspace_panel.action_cursor = 0;
+        self.workspace_panel.list_cursor = 0;
+        self.workspace_panel.message = None;
+        self.workspace_panel.suggestions.clear();
+        self.workspace_panel.choice_state = None;
+        self.workspace_panel.dirty_confirm = None;
+    }
+
+    fn close_workspace_panel(&mut self) {
+        self.workspace_panel.open = false;
+        self.workspace_panel.message = None;
+        self.workspace_panel.suggestions.clear();
+        self.workspace_panel.choice_state = None;
+        self.workspace_panel.dirty_confirm = None;
+    }
+
+    fn workspace_panel_actions(&self) -> Vec<WorkspaceActionRow> {
+        if self.workspace_panel.dirty_confirm.is_some() {
+            return vec![
+                WorkspaceActionRow::SaveAndSwitch,
+                WorkspaceActionRow::DiscardAndSwitch,
+                WorkspaceActionRow::CancelPending,
+            ];
+        }
+        if let Some(choice) = &self.workspace_panel.choice_state {
+            let mut actions = Vec::new();
+            if choice.has_legacy_repo_settings {
+                actions.push(WorkspaceActionRow::ImportLegacyChoice);
+            }
+            actions.push(WorkspaceActionRow::UseGlobalChoice);
+            actions.push(WorkspaceActionRow::CreateRepoChoice);
+            return actions;
+        }
+
+        let mut actions = vec![WorkspaceActionRow::SwitchTypedPath];
+        if self.settings_scope == SettingsScope::Global {
+            actions.push(WorkspaceActionRow::EnableRepoCurrent);
+        } else {
+            actions.push(WorkspaceActionRow::UseGlobalCurrent);
+        }
+        actions
+    }
+
+    fn workspace_list_entries(&self) -> &[PathBuf] {
+        if self.workspace_panel.suggestions.is_empty() {
+            &self.workspace_panel.recent_workspaces
+        } else {
+            &self.workspace_panel.suggestions
+        }
+    }
+
+    fn workspace_insert_char(&mut self, c: char) {
+        let byte_idx = self.workspace_char_to_byte(self.workspace_panel.cursor);
+        self.workspace_panel.input.insert(byte_idx, c);
+        self.workspace_panel.cursor = self.workspace_panel.cursor.saturating_add(1);
+    }
+
+    fn workspace_char_to_byte(&self, char_idx: usize) -> usize {
+        if char_idx == 0 {
+            return 0;
+        }
+        self.workspace_panel
+            .input
+            .char_indices()
+            .nth(char_idx)
+            .map_or(self.workspace_panel.input.len(), |(idx, _)| idx)
+    }
+
+    fn workspace_backspace(&mut self) {
+        if self.workspace_panel.cursor == 0 {
+            return;
+        }
+        let start = self.workspace_char_to_byte(self.workspace_panel.cursor - 1);
+        let end = self.workspace_char_to_byte(self.workspace_panel.cursor);
+        self.workspace_panel.input.replace_range(start..end, "");
+        self.workspace_panel.cursor = self.workspace_panel.cursor.saturating_sub(1);
+    }
+
+    fn workspace_move_left(&mut self) {
+        self.workspace_panel.cursor = self.workspace_panel.cursor.saturating_sub(1);
+    }
+
+    fn workspace_move_right(&mut self) {
+        let len = self.workspace_panel.input.chars().count();
+        self.workspace_panel.cursor = (self.workspace_panel.cursor + 1).min(len);
+    }
+
+    fn workspace_focus_next(&mut self) {
+        self.workspace_panel.focus = match self.workspace_panel.focus {
+            WorkspaceFocus::Input => WorkspaceFocus::Actions,
+            WorkspaceFocus::Actions => WorkspaceFocus::List,
+            WorkspaceFocus::List => WorkspaceFocus::Input,
+        };
+    }
+
+    fn workspace_cursor_up(&mut self) {
+        match self.workspace_panel.focus {
+            WorkspaceFocus::Input => {}
+            WorkspaceFocus::Actions => {
+                self.workspace_panel.action_cursor =
+                    self.workspace_panel.action_cursor.saturating_sub(1);
+            }
+            WorkspaceFocus::List => {
+                self.workspace_panel.list_cursor =
+                    self.workspace_panel.list_cursor.saturating_sub(1);
+            }
+        }
+    }
+
+    fn workspace_cursor_down(&mut self) {
+        match self.workspace_panel.focus {
+            WorkspaceFocus::Input => {}
+            WorkspaceFocus::Actions => {
+                let max = self.workspace_panel_actions().len().saturating_sub(1);
+                self.workspace_panel.action_cursor =
+                    (self.workspace_panel.action_cursor + 1).min(max);
+            }
+            WorkspaceFocus::List => {
+                let max = self.workspace_list_entries().len().saturating_sub(1);
+                self.workspace_panel.list_cursor = (self.workspace_panel.list_cursor + 1).min(max);
+            }
+        }
+    }
+
+    fn workspace_select_list_entry(&mut self) {
+        let Some(path) = self
+            .workspace_list_entries()
+            .get(self.workspace_panel.list_cursor)
+            .cloned()
+        else {
+            return;
+        };
+        self.workspace_panel.input = path.display().to_string();
+        self.workspace_panel.cursor = self.workspace_panel.input.chars().count();
+        self.workspace_panel.focus = WorkspaceFocus::Actions;
+        self.workspace_panel.action_cursor = 0;
+        let _ = self.request_workspace_switch_from_input();
+    }
+
+    fn request_workspace_switch_from_input(&mut self) -> io::Result<()> {
+        let target_root = normalize_workspace_path(&self.workspace_panel.input)?;
+        let registry = WorkspaceRegistry::load(&self.runtime_paths.workspace_registry_path)
+            .unwrap_or_default();
+        let pending = match resolve_scope(&registry, &target_root) {
+            ScopeResolution::Resolved(scope) => WorkspacePendingOperation::SwitchRepo {
+                workspace_root: target_root,
+                target_scope: scope,
+                import_legacy: false,
+            },
+            ScopeResolution::NeedsChoice {
+                has_legacy_repo_settings,
+            } => {
+                self.workspace_panel.choice_state = Some(WorkspaceChoiceState {
+                    workspace_root: target_root,
+                    has_legacy_repo_settings,
+                });
+                self.workspace_panel.message =
+                    Some("Choose how this repo should persist cockpit settings.".to_string());
+                self.workspace_panel.focus = WorkspaceFocus::Actions;
+                self.workspace_panel.action_cursor = 0;
+                return Ok(());
+            }
+        };
+        self.prepare_or_apply_workspace_operation(pending)
+    }
+
+    fn prepare_or_apply_workspace_operation(
+        &mut self,
+        pending: WorkspacePendingOperation,
+    ) -> io::Result<()> {
+        let target_differs = match &pending {
+            WorkspacePendingOperation::SwitchRepo {
+                workspace_root,
+                target_scope,
+                ..
+            }
+            | WorkspacePendingOperation::ToggleScope {
+                workspace_root,
+                target_scope,
+            } => workspace_root != &self.workspace_root || *target_scope != self.settings_scope,
+        };
+
+        if target_differs && self.is_dirty() {
+            self.workspace_panel.dirty_confirm = Some(pending);
+            self.workspace_panel.message =
+                Some("Current cockpit has unsaved edits. Save before switching?".to_string());
+            self.workspace_panel.focus = WorkspaceFocus::Actions;
+            self.workspace_panel.action_cursor = 0;
+            return Ok(());
+        }
+
+        self.apply_workspace_operation(pending)
+    }
+
+    fn apply_workspace_operation(&mut self, pending: WorkspacePendingOperation) -> io::Result<()> {
+        let current_effective = self.current_ui_settings_json()?;
+        let (workspace_root, target_scope, import_legacy) = match pending {
+            WorkspacePendingOperation::SwitchRepo {
+                workspace_root,
+                target_scope,
+                import_legacy,
+            } => (workspace_root, target_scope, import_legacy),
+            WorkspacePendingOperation::ToggleScope {
+                workspace_root,
+                target_scope,
+            } => (workspace_root, target_scope, false),
+        };
+
+        if import_legacy {
+            let _ = import_legacy_repo_settings(&workspace_root)?;
+        }
+
+        let target_paths = WorkspacePaths::for_workspace(
+            &self.runtime_paths,
+            workspace_root.clone(),
+            target_scope,
+        );
+
+        let bootstrap_seed = if target_scope == SettingsScope::RepoLocal {
+            Some(current_effective.as_str())
+        } else {
+            None
+        };
+        bootstrap_settings_file(
+            &target_paths,
+            bootstrap_seed,
+            &serialize_ui_settings(&default_ui_settings())?,
+        )?;
+
+        let mut registry = WorkspaceRegistry::load(&self.runtime_paths.workspace_registry_path)
+            .unwrap_or_default();
+        registry.remember_workspace(&workspace_root);
+        registry.set_preference(&workspace_root, target_scope);
+        registry.save(&self.runtime_paths.workspace_registry_path)?;
+        self.refresh_workspace_registry();
+
+        self.load_workspace_state(workspace_root.clone(), target_scope);
+        self.workspace_panel.input = workspace_root.display().to_string();
+        self.workspace_panel.cursor = self.workspace_panel.input.chars().count();
+        self.workspace_panel.message = if self.run_is_active_or_paused() && self.relaunch_required {
+            Some("Workspace switched. Relaunch to apply to agents.".to_string())
+        } else {
+            None
+        };
+        self.workspace_panel.choice_state = None;
+        self.workspace_panel.dirty_confirm = None;
+        self.close_workspace_panel();
+        Ok(())
+    }
+
+    fn execute_workspace_action(&mut self) {
+        let action = self
+            .workspace_panel_actions()
+            .get(self.workspace_panel.action_cursor)
+            .copied();
+        let result: io::Result<()> = match action {
+            Some(WorkspaceActionRow::SwitchTypedPath) => self.request_workspace_switch_from_input(),
+            Some(WorkspaceActionRow::UseGlobalCurrent) => {
+                let pending = WorkspacePendingOperation::ToggleScope {
+                    workspace_root: self.workspace_root.clone(),
+                    target_scope: SettingsScope::Global,
+                };
+                self.prepare_or_apply_workspace_operation(pending)
+            }
+            Some(WorkspaceActionRow::EnableRepoCurrent) => {
+                let pending = WorkspacePendingOperation::ToggleScope {
+                    workspace_root: self.workspace_root.clone(),
+                    target_scope: SettingsScope::RepoLocal,
+                };
+                self.prepare_or_apply_workspace_operation(pending)
+            }
+            Some(WorkspaceActionRow::UseGlobalChoice) => {
+                let Some(choice) = self.workspace_panel.choice_state.clone() else {
+                    return;
+                };
+                self.prepare_or_apply_workspace_operation(WorkspacePendingOperation::SwitchRepo {
+                    workspace_root: choice.workspace_root,
+                    target_scope: SettingsScope::Global,
+                    import_legacy: false,
+                })
+            }
+            Some(WorkspaceActionRow::CreateRepoChoice) => {
+                let Some(choice) = self.workspace_panel.choice_state.clone() else {
+                    return;
+                };
+                self.prepare_or_apply_workspace_operation(WorkspacePendingOperation::SwitchRepo {
+                    workspace_root: choice.workspace_root,
+                    target_scope: SettingsScope::RepoLocal,
+                    import_legacy: false,
+                })
+            }
+            Some(WorkspaceActionRow::ImportLegacyChoice) => {
+                let Some(choice) = self.workspace_panel.choice_state.clone() else {
+                    return;
+                };
+                self.prepare_or_apply_workspace_operation(WorkspacePendingOperation::SwitchRepo {
+                    workspace_root: choice.workspace_root,
+                    target_scope: SettingsScope::RepoLocal,
+                    import_legacy: true,
+                })
+            }
+            Some(WorkspaceActionRow::SaveAndSwitch) => {
+                let pending = self.workspace_panel.dirty_confirm.clone();
+                let persisted = self.persist_current_workspace_state(false);
+                match (persisted, pending) {
+                    (Ok(()), Some(pending)) => self.apply_workspace_operation(pending),
+                    (Ok(()), None) => Ok(()),
+                    (Err(err), _) => Err(err),
+                }
+            }
+            Some(WorkspaceActionRow::DiscardAndSwitch) => {
+                if let Some(pending) = self.workspace_panel.dirty_confirm.clone() {
+                    self.apply_workspace_operation(pending)
+                } else {
+                    Ok(())
+                }
+            }
+            Some(WorkspaceActionRow::CancelPending) => {
+                self.workspace_panel.dirty_confirm = None;
+                self.workspace_panel.choice_state = None;
+                self.workspace_panel.message = None;
+                Ok(())
+            }
+            None => Ok(()),
+        };
+
+        if let Err(err) = result {
+            self.workspace_panel.choice_state = None;
+            self.workspace_panel.dirty_confirm = None;
+            self.workspace_panel.message = Some(err.to_string());
+            self.workspace_panel.suggestions = closest_workspace_suggestions(
+                &self.workspace_panel.input,
+                &WorkspaceRegistry::load(&self.runtime_paths.workspace_registry_path)
+                    .unwrap_or_default(),
+            )
+            .into_iter()
+            .map(|entry| entry.path)
+            .collect();
+            self.workspace_panel.focus = if self.workspace_panel.suggestions.is_empty() {
+                WorkspaceFocus::Input
+            } else {
+                WorkspaceFocus::List
+            };
+            self.workspace_panel.list_cursor = 0;
+        }
+    }
+
     fn execute_command_action(
         &mut self,
         action: CommandActionId,
@@ -1416,6 +2013,8 @@ impl UiState {
                     agent_system_prompts: self.agent_system_prompts.clone(),
                     presets: self.presets.clone(),
                     active_preset_idx: self.active_preset_idx,
+                    workspace_root: self.workspace_root.clone(),
+                    settings_scope: self.settings_scope,
                 })
             }
             CommandActionId::PauseResume => {
@@ -1466,6 +2065,8 @@ impl UiState {
                         agent_system_prompts: self.agent_system_prompts.clone(),
                         presets: self.presets.clone(),
                         active_preset_idx: self.active_preset_idx,
+                        workspace_root: self.workspace_root.clone(),
+                        settings_scope: self.settings_scope,
                     });
                 }
                 None
@@ -1525,17 +2126,33 @@ impl UiState {
         let (width, height) = terminal::size()?;
         let width = width.max(1) as usize;
         let height = height.max(2) as usize;
+        let overlay_open = self.preset_mode_active()
+            || self.modal_state == ModalState::Help
+            || self.workspace_panel.open;
+        let overlay_transitioned = overlay_open != self.overlay_was_open;
+        let workspace_modal_only = self.workspace_panel.open
+            && self.frame_drawn
+            && self.last_size == Some((width, height))
+            && !overlay_transitioned;
 
         let size = (width, height);
-        if !self.frame_drawn || self.last_size != Some(size) {
+        if !self.frame_drawn || self.last_size != Some(size) || overlay_transitioned {
             queue!(out, MoveTo(0, 0), Clear(ClearType::All))?;
             self.frame_drawn = true;
             self.last_size = Some(size);
         }
+        self.overlay_was_open = overlay_open;
 
         if width < 50 || height < 16 {
             let msg = "Terminal too small. Resize to at least 50x16.";
             queue!(out, MoveTo(0, 0), Print(msg))?;
+            out.flush()?;
+            return Ok(());
+        }
+
+        if workspace_modal_only {
+            render_workspace_modal(out, width, height, self)?;
+            queue!(out, EndSynchronizedUpdate)?;
             out.flush()?;
             return Ok(());
         }
@@ -2063,6 +2680,9 @@ impl UiState {
         // Render help modal if open.
         if self.modal_state == ModalState::Help {
             render_help_modal(out, width, height)?;
+        }
+        if self.workspace_panel.open {
+            render_workspace_modal(out, width, height, self)?;
         }
 
         queue!(out, EndSynchronizedUpdate)?;
@@ -3007,6 +3627,15 @@ fn render_agents_panel(
     width: usize,
     height: usize,
 ) -> Result<(), AppError> {
+    let repo_name = state
+        .workspace_root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_else(|| state.workspace_root.as_os_str().to_str().unwrap_or("."));
+    let mut scope_line = format!("scope: {}", state.settings_scope.label());
+    if state.relaunch_required {
+        scope_line.push_str(" | relaunch");
+    }
     let turns_display = if state.editing_turns {
         if state.turns_buffer.is_empty() {
             "_".to_string()
@@ -3017,6 +3646,8 @@ fn render_agents_panel(
         state.turns.to_string()
     };
     let mut rows = vec![
+        format!("repo: {}", repo_name),
+        scope_line,
         format!("turns: {} [1-9/`]", turns_display),
         format!("mode: {} [x]", routing_mode_short(state.routing_mode)),
         format!("layout: {} [y]", layout_mode_short(state.layout_mode)),
@@ -3059,7 +3690,7 @@ fn render_agents_panel(
     for row in 0..height.saturating_sub(1) {
         queue!(out, MoveTo(x as u16, (y + 1 + row) as u16))?;
         let line = rows.get(row).map_or("", String::as_str);
-        let fg = if row == 0 && state.editing_turns {
+        let fg = if row == 2 && state.editing_turns {
             Color::Rgb {
                 r: 180,
                 g: 150,
@@ -4297,6 +4928,19 @@ fn render_preset_mode_overlay(
     } else {
         0
     };
+    let fill = " ".repeat(overlay_w.saturating_sub(2));
+
+    // Clear the full interior so shorter lists and naming mode don't leave
+    // stale glyphs visible in the unused rows near the bottom.
+    for row in 1..overlay_h.saturating_sub(1) {
+        queue!(
+            out,
+            MoveTo((overlay_x + 1) as u16, (overlay_y + row) as u16),
+            SetAttribute(Attribute::Reset),
+            Print(&fill),
+            SetAttribute(Attribute::Reset),
+        )?;
+    }
 
     draw_box(
         out,
@@ -4476,6 +5120,25 @@ fn draw_box(
         queue!(out, MoveTo((x + width - 1) as u16, row as u16), Print("│"))?;
     }
 
+    queue!(out, SetAttribute(Attribute::Reset))?;
+    Ok(())
+}
+
+fn fill_box_interior(
+    out: &mut impl Write,
+    x: usize,
+    y: usize,
+    width: usize,
+    height: usize,
+) -> Result<(), AppError> {
+    if width < 2 || height < 2 {
+        return Ok(());
+    }
+
+    let fill = " ".repeat(width.saturating_sub(2));
+    for row in (y + 1)..(y + height - 1) {
+        queue!(out, MoveTo((x + 1) as u16, row as u16), Print(&fill))?;
+    }
     queue!(out, SetAttribute(Attribute::Reset))?;
     Ok(())
 }
@@ -5086,6 +5749,279 @@ fn render_help_modal(out: &mut impl Write, width: usize, height: usize) -> Resul
     Ok(())
 }
 
+fn workspace_action_label(action: WorkspaceActionRow) -> &'static str {
+    match action {
+        WorkspaceActionRow::SwitchTypedPath => "Switch to typed path",
+        WorkspaceActionRow::UseGlobalCurrent => "Use Global Settings",
+        WorkspaceActionRow::EnableRepoCurrent => "Enable Repo Settings",
+        WorkspaceActionRow::UseGlobalChoice => "Use Global Settings",
+        WorkspaceActionRow::CreateRepoChoice => "Create Repo Settings",
+        WorkspaceActionRow::ImportLegacyChoice => "Import old repo settings",
+        WorkspaceActionRow::SaveAndSwitch => "Save and Switch",
+        WorkspaceActionRow::DiscardAndSwitch => "Discard and Switch",
+        WorkspaceActionRow::CancelPending => "Cancel",
+    }
+}
+
+fn render_workspace_modal(
+    out: &mut impl Write,
+    width: usize,
+    height: usize,
+    state: &UiState,
+) -> Result<(), AppError> {
+    let modal_w = width.saturating_sub(10).min(90).max(50);
+    let modal_h = height.saturating_sub(6).min(24).max(16);
+    let modal_x = (width.saturating_sub(modal_w)) / 2;
+    let modal_y = (height.saturating_sub(modal_h)) / 2;
+    draw_box(
+        out,
+        modal_x,
+        modal_y,
+        modal_w,
+        modal_h,
+        Some("Workspace"),
+        Some(Color::Rgb {
+            r: 92,
+            g: 112,
+            b: 124,
+        }),
+    )?;
+    fill_box_interior(out, modal_x, modal_y, modal_w, modal_h)?;
+
+    let inner_x = modal_x + 2;
+    let inner_w = modal_w.saturating_sub(4);
+    let inner_fill = " ".repeat(inner_w);
+    let mut y = modal_y + 2;
+    let repo_name = state
+        .workspace_root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(".");
+    let mut scope_line = format!("Scope: {}", state.settings_scope.label());
+    if state.relaunch_required {
+        scope_line.push_str(" | relaunch");
+    }
+
+    let summary = [
+        format!("Repo: {repo_name}"),
+        format!("Path: {}", state.workspace_root.display()),
+        scope_line,
+    ];
+    for line in summary {
+        if y >= modal_y + modal_h.saturating_sub(2) {
+            break;
+        }
+        queue!(
+            out,
+            MoveTo(inner_x as u16, y as u16),
+            SetForegroundColor(Color::Rgb {
+                r: 214,
+                g: 220,
+                b: 226
+            }),
+            Print(pad_to_width(&fit_with_ellipsis(&line, inner_w), inner_w)),
+            SetAttribute(Attribute::Reset)
+        )?;
+        y += 1;
+    }
+
+    if y < modal_y + modal_h.saturating_sub(2) {
+        queue!(
+            out,
+            MoveTo(inner_x as u16, y as u16),
+            Print(&inner_fill),
+            SetAttribute(Attribute::Reset)
+        )?;
+    }
+
+    if y < modal_y + modal_h.saturating_sub(2) {
+        let input_label = "Repo path:";
+        let input_value = &state.workspace_panel.input;
+        let input_focus = state.workspace_panel.focus == WorkspaceFocus::Input;
+        queue!(
+            out,
+            MoveTo(inner_x as u16, y as u16),
+            SetForegroundColor(Color::Rgb {
+                r: 150,
+                g: 156,
+                b: 170
+            }),
+            Print(input_label),
+            SetAttribute(Attribute::Reset)
+        )?;
+        y += 1;
+        let input_border = if input_focus {
+            Some(Color::Rgb {
+                r: 175,
+                g: 156,
+                b: 90,
+            })
+        } else {
+            None
+        };
+        draw_box(out, inner_x, y, inner_w, 3, None, input_border)?;
+        fill_box_interior(out, inner_x, y, inner_w, 3)?;
+        let mut display = input_value.clone();
+        if input_focus {
+            let byte_idx = state.workspace_char_to_byte(state.workspace_panel.cursor);
+            display.insert(byte_idx, '_');
+        }
+        queue!(
+            out,
+            MoveTo((inner_x + 1) as u16, (y + 1) as u16),
+            SetForegroundColor(Color::Rgb {
+                r: 222,
+                g: 227,
+                b: 232
+            }),
+            Print(pad_to_width(
+                &fit_with_ellipsis(&display, inner_w.saturating_sub(2)),
+                inner_w.saturating_sub(2)
+            )),
+            SetAttribute(Attribute::Reset)
+        )?;
+        y += 4;
+    }
+
+    let actions = state.workspace_panel_actions();
+    if y < modal_y + modal_h.saturating_sub(2) {
+        queue!(
+            out,
+            MoveTo(inner_x as u16, y as u16),
+            SetForegroundColor(Color::Rgb {
+                r: 150,
+                g: 156,
+                b: 170
+            }),
+            Print("Actions:"),
+            SetAttribute(Attribute::Reset)
+        )?;
+        y += 1;
+        for (idx, action) in actions.iter().enumerate() {
+            if y >= modal_y + modal_h.saturating_sub(5) {
+                break;
+            }
+            let selected = state.workspace_panel.focus == WorkspaceFocus::Actions
+                && idx == state.workspace_panel.action_cursor;
+            let prefix = if selected { ">" } else { " " };
+            let color = if selected {
+                Color::Rgb {
+                    r: 240,
+                    g: 214,
+                    b: 132,
+                }
+            } else {
+                Color::Rgb {
+                    r: 214,
+                    g: 220,
+                    b: 226,
+                }
+            };
+            queue!(
+                out,
+                MoveTo(inner_x as u16, y as u16),
+                SetForegroundColor(color),
+                Print(pad_to_width(
+                    &fit_with_ellipsis(
+                        &format!("{prefix} {}", workspace_action_label(*action)),
+                        inner_w
+                    ),
+                    inner_w
+                )),
+                SetAttribute(Attribute::Reset)
+            )?;
+            y += 1;
+        }
+    }
+
+    let list_title = if state.workspace_panel.suggestions.is_empty() {
+        "Recent workspaces:"
+    } else {
+        "Suggestions:"
+    };
+    if y < modal_y + modal_h.saturating_sub(3) {
+        queue!(
+            out,
+            MoveTo(inner_x as u16, y as u16),
+            SetForegroundColor(Color::Rgb {
+                r: 150,
+                g: 156,
+                b: 170
+            }),
+            Print(list_title),
+            SetAttribute(Attribute::Reset)
+        )?;
+        y += 1;
+        for (idx, entry) in state.workspace_list_entries().iter().enumerate() {
+            if y >= modal_y + modal_h.saturating_sub(2) {
+                break;
+            }
+            let selected = state.workspace_panel.focus == WorkspaceFocus::List
+                && idx == state.workspace_panel.list_cursor;
+            let prefix = if selected { ">" } else { " " };
+            let color = if selected {
+                Color::Rgb {
+                    r: 240,
+                    g: 214,
+                    b: 132,
+                }
+            } else {
+                Color::Rgb {
+                    r: 200,
+                    g: 206,
+                    b: 212,
+                }
+            };
+            queue!(
+                out,
+                MoveTo(inner_x as u16, y as u16),
+                SetForegroundColor(color),
+                Print(pad_to_width(
+                    &fit_with_ellipsis(&format!("{prefix} {}", entry.display()), inner_w),
+                    inner_w
+                )),
+                SetAttribute(Attribute::Reset)
+            )?;
+            y += 1;
+        }
+    }
+
+    if let Some(message) = &state.workspace_panel.message {
+        let msg_y = modal_y + modal_h.saturating_sub(2);
+        queue!(
+            out,
+            MoveTo(inner_x as u16, msg_y as u16),
+            SetForegroundColor(Color::Rgb {
+                r: 237,
+                g: 192,
+                b: 124
+            }),
+            Print(pad_to_width(&fit_with_ellipsis(message, inner_w), inner_w)),
+            SetAttribute(Attribute::Reset)
+        )?;
+    }
+
+    // Blank any untouched interior rows so stale modal content does not linger,
+    // without wiping the full panel on every keystroke.
+    let content_end = if state.workspace_panel.message.is_some() {
+        modal_y + modal_h.saturating_sub(3)
+    } else {
+        modal_y + modal_h.saturating_sub(2)
+    };
+    let mut clear_y = y;
+    while clear_y <= content_end {
+        queue!(
+            out,
+            MoveTo(inner_x as u16, clear_y as u16),
+            Print(&inner_fill),
+            SetAttribute(Attribute::Reset)
+        )?;
+        clear_y += 1;
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5103,6 +6039,12 @@ mod tests {
             [String::new(), String::new()],
             Vec::new(),
             None,
+            PathBuf::from("/tmp/demo-repo"),
+            SettingsScope::Global,
+            false,
+            None,
+            None,
+            RuntimePaths::new(PathBuf::from("/tmp/antiphon-runtime")),
         )
     }
 
@@ -5144,7 +6086,10 @@ mod tests {
     }
 
     fn agent_runtime_status(state: &UiState, agent_idx: usize) -> &'static str {
-        match (state.working.agent_working[agent_idx], state.active_agent == Some(agent_idx)) {
+        match (
+            state.working.agent_working[agent_idx],
+            state.active_agent == Some(agent_idx),
+        ) {
             (true, true) => "live",
             (true, false) => "busy",
             (false, true) => "focus",

@@ -1,5 +1,5 @@
 use std::env;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -64,8 +64,10 @@ impl AgentSpec {
         }
     }
 
-    fn codex_api_home(&self) -> String {
-        env::var("CODEX_API_CODEX_HOME").unwrap_or_else(|_| ".codex-api-home".to_string())
+    fn codex_api_home(&self, default_codex_api_home: &Path) -> PathBuf {
+        env::var("CODEX_API_CODEX_HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| default_codex_api_home.to_path_buf())
     }
 
     fn codex_api_model(&self) -> String {
@@ -147,6 +149,8 @@ pub async fn stream_reply<F, Fut>(
     transcript: &str,
     debug: bool,
     session: &mut AgentSession,
+    workspace_root: &Path,
+    default_codex_api_home: &Path,
     mut on_raw_line: impl FnMut(&str, Option<String>, Vec<ToolStreamEvent>),
     mut on_token: F,
 ) -> Result<String, AppError>
@@ -159,6 +163,7 @@ where
     let mut cmd = Command::new(&exec_cmd);
     cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
+        .current_dir(workspace_root)
         .kill_on_drop(true);
 
     if debug {
@@ -192,7 +197,7 @@ where
                             "codex-api requires OPENAI_API_KEY in environment (.env)".to_string(),
                         )
                     })?;
-                let codex_home = agent.codex_api_home();
+                let codex_home = agent.codex_api_home(default_codex_api_home);
                 std::fs::create_dir_all(&codex_home)?;
                 if !session.codex_api_login_verified {
                     ensure_codex_api_login(&exec_cmd, &codex_home, &api_key).await?;
@@ -349,7 +354,7 @@ where
 
 async fn ensure_codex_api_login(
     exec_cmd: &str,
-    codex_home: &str,
+    codex_home: &Path,
     api_key: &str,
 ) -> Result<(), AppError> {
     let status_out = Command::new(exec_cmd)
@@ -395,7 +400,7 @@ async fn ensure_codex_api_login(
     Ok(())
 }
 
-async fn codex_exec_supports_flag(exec_cmd: &str, codex_home: &str, flag: &str) -> bool {
+async fn codex_exec_supports_flag(exec_cmd: &str, codex_home: &Path, flag: &str) -> bool {
     let out = match Command::new(exec_cmd)
         .env("CODEX_HOME", codex_home)
         .arg("exec")
