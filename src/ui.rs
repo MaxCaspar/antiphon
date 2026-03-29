@@ -543,6 +543,11 @@ fn handle_key_event(
                     return state.execute_command_action(CommandActionId::Help, control_tx);
                 }
                 KeyCode::Esc => {
+                    if state.fullscreen_knot {
+                        state.fullscreen_knot = false;
+                        state.last_size = None;
+                        return None;
+                    }
                     if state.modal_state == ModalState::Help {
                         state.modal_state = ModalState::Hidden;
                         state.last_size = None;
@@ -557,6 +562,10 @@ fn handle_key_event(
             }
 
             match (code, modifiers) {
+                (KeyCode::Char('f'), KeyModifiers::CONTROL) => {
+                    state.fullscreen_knot = !state.fullscreen_knot;
+                    state.last_size = None;
+                }
                 (KeyCode::Char('q'), KeyModifiers::CONTROL)
                 | (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
                     return state.execute_command_action(CommandActionId::Quit, control_tx);
@@ -843,6 +852,7 @@ struct UiState {
     workspace_panel: WorkspacePanelState,
     persisted_snapshot: String,
     overlay_was_open: bool,
+    fullscreen_knot: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -856,6 +866,7 @@ struct FooterView {
     editing_prompt: bool,
     editing_turns: bool,
     agent_chooser: Option<usize>,
+    fullscreen_knot: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -963,6 +974,7 @@ impl UiState {
             },
             persisted_snapshot: String::new(),
             overlay_was_open: false,
+            fullscreen_knot: false,
         };
         state.refresh_workspace_registry();
         state.persisted_snapshot = state
@@ -2150,6 +2162,51 @@ impl UiState {
             return Ok(());
         }
 
+        if self.fullscreen_knot {
+            // "A N T I P H O N" centered — compute row first so knot skips it entirely
+            let title = "A N T I P H O N";
+            let title_len = title.chars().count(); // 15
+            let title_x = (width.saturating_sub(title_len)) / 2;
+            let title_y = height / 2;
+            // knot row is relative to its inner canvas (starts at y=1)
+            let knot_skip_row = title_y.saturating_sub(1);
+
+            draw_box(out, 0, 0, width, height, None, None)?;
+            render_knot_panel(out, self.anim_frame, 1, 1, width - 2, height - 2, true, Some(knot_skip_row))?;
+
+            // Write title onto the untouched row
+            queue!(out, MoveTo(title_x as u16, title_y as u16), SetAttribute(Attribute::Reset))?;
+            let n_letters = title.chars().filter(|c| !c.is_whitespace()).count() as f32 - 1.0;
+            let mut letter_idx = 0usize;
+            for ch in title.chars() {
+                if ch == ' ' {
+                    queue!(out, Print(' '))?;
+                } else {
+                    let t = letter_idx as f32 / n_letters;
+                    let r = (170.0 + (240.0 - 170.0) * t).round() as u8;
+                    let g = (120.0 + (165.0 - 120.0) * t).round() as u8;
+                    let b = (240.0 + (40.0  - 240.0) * t).round() as u8;
+                    queue!(out, SetForegroundColor(Color::Rgb { r, g, b }), Print(ch))?;
+                    letter_idx += 1;
+                }
+            }
+            queue!(out, SetAttribute(Attribute::Reset))?;
+
+            let hint = "[Ctrl-F] exit  [Esc] exit";
+            let hint_x = (width.saturating_sub(hint.len())) / 2;
+            let hint_y = height.saturating_sub(2);
+            queue!(
+                out,
+                MoveTo(hint_x as u16, hint_y as u16),
+                SetForegroundColor(Color::Rgb { r: 60, g: 63, b: 78 }),
+                Print(hint),
+                SetAttribute(Attribute::Reset),
+            )?;
+            queue!(out, EndSynchronizedUpdate)?;
+            out.flush()?;
+            return Ok(());
+        }
+
         if workspace_modal_only {
             render_workspace_modal(out, width, height, self)?;
             queue!(out, EndSynchronizedUpdate)?;
@@ -2674,6 +2731,7 @@ impl UiState {
                 editing_prompt: self.editing_prompt,
                 editing_turns: self.editing_turns,
                 agent_chooser: self.agent_chooser.map(|chooser| chooser.agent_idx),
+                fullscreen_knot: self.fullscreen_knot,
             },
         )?;
 
@@ -3006,7 +3064,7 @@ impl UiState {
             render_agents_panel(out, self, agent_x, body_y, agent_w, body_h)?;
         }
         render_divider_at(out, telem_x - 1, body_y, body_h)?;
-        render_knot_panel(out, self.anim_frame, telem_x, body_y, telem_w, body_h)?;
+        render_knot_panel(out, self.anim_frame, telem_x, body_y, telem_w, body_h, false, None)?;
 
         let prompt_body_w = prompt_w;
         let prompt_body_h = body_h;
@@ -3396,6 +3454,8 @@ fn render_knot_panel(
     y: usize,
     width: usize,
     height: usize,
+    fullscreen: bool,
+    skip_row: Option<usize>,
 ) -> Result<(), AppError> {
     if width == 0 || height == 0 {
         return Ok(());
@@ -3419,10 +3479,11 @@ fn render_knot_panel(
     let mut depthbuf: Vec<f32> = vec![-1.0_f32; cells]; // -1 = empty
     let mut huebuf: Vec<f32> = vec![0.0_f32; cells]; // 0=purple, 1=amber
 
-    const SAMPLES: usize = 900;
+    // Fullscreen gets 4× more samples so the larger canvas stays solid
+    let samples: usize = if fullscreen { 3600 } else { 900 };
 
-    for i in 0..SAMPLES {
-        let t = i as f64 * TAU / SAMPLES as f64;
+    for i in 0..samples {
+        let t = i as f64 * TAU / samples as f64;
 
         let kx = t.sin() + 2.0 * (2.0 * t).sin();
         let ky = t.cos() - 2.0 * (2.0 * t).cos();
@@ -3479,6 +3540,9 @@ fn render_knot_panel(
     };
 
     for row in 0..height {
+        if skip_row == Some(row) {
+            continue;
+        }
         queue!(out, MoveTo(x as u16, (y + row) as u16))?;
         for col in 0..width {
             let idx = row * width + col;
@@ -4062,6 +4126,15 @@ fn render_footer_lines(
             } else {
                 label
             },
+            accent,
+            false,
+        )?;
+        row1_visual += draw_footer_sep(out, sep)?;
+        row1_visual += draw_footer_action(
+            out,
+            "Ctrl-F",
+            if view.fullscreen_knot { "knot:full" } else { "knot" },
+            if view.fullscreen_knot { label_active } else { label },
             accent,
             false,
         )?;
@@ -5661,7 +5734,7 @@ fn render_help_modal(out: &mut impl Write, width: usize, height: usize) -> Resul
         ("x", "Routing"),
         ("y", "Layout"),
     ];
-    let view: &[(&str, &str)] = &[("n", "Thinking"), ("v", "Selection"), ("b", "Tmux")];
+    let view: &[(&str, &str)] = &[("n", "Thinking"), ("v", "Selection"), ("b", "Tmux"), ("Ctrl-F", "Knot fullscreen")];
 
     let misc_rows = lifecycle.len().max(config.len()).max(view.len());
     for i in 0..misc_rows {
@@ -6068,6 +6141,7 @@ mod tests {
             editing_prompt: state.editing_prompt,
             editing_turns: state.editing_turns,
             agent_chooser: state.agent_chooser.map(|chooser| chooser.agent_idx),
+            fullscreen_knot: state.fullscreen_knot,
         }) {
             FooterBadgeState::Ready => "ready",
             FooterBadgeState::Live => "live",
@@ -6950,6 +7024,7 @@ mod tests {
             editing_prompt: false,
             editing_turns: false,
             agent_chooser: None,
+            fullscreen_knot: false,
         };
 
         assert_eq!(footer_badge_state(&base), FooterBadgeState::Ready);

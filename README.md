@@ -1,4 +1,4 @@
-What happens when two AI agents talk to each other? **Antiphon** is a terminal UI (TUI + CLI) built around that question — two agents, 🪻**Aria** and 🌿**Basil**, in a turn-based dialogue. 
+What happens when two AI agents talk to each other? **A N T I P H O N** is a terminal UI (TUI + CLI) built around that question — two agents, 🪻**Aria** and 🌿**Basil**, in a turn-based dialogue. 
 
 Point them at a feature, a design question, or a fictional world and watch them go. They're coding agents at heart, so they'll want to build things, which makes them surprisingly effective on real problems.
 
@@ -9,7 +9,7 @@ Ships with presets. MIT licensed — v1, fork it freely.
 ![Screenshot](assets/antiphon-TUI.png)
 
 > [!CAUTION]
-> Agents launched by Antiphon run with full local permissions. They can read, write, and execute in the working directory without extra prompts. Only use it in repos and with prompts you trust.
+> Agents launched by A N T I P H O N run with full local permissions. They can read, write, and execute in the working directory without extra prompts. Only use it in repos and with prompts you trust.
 
 ## Install
 
@@ -78,11 +78,12 @@ Use `g` inside the TUI to switch the active repo without restarting the app. The
 | `x` | Cycle routing mode |
 | `y` | Toggle layout |
 | `b` | Toggle tmux side panes |
+| `Ctrl-F` | Fullscreen knot animation |
 | `?` / `h` | Help |
 
 ## Workspaces
 
-Antiphon keeps an explicit active workspace instead of assuming the process cwd forever.
+A N T I P H O N keeps an explicit active workspace instead of assuming the process cwd forever.
 
 - `g` opens the workspace panel.
 - The status area shows the current repo and whether its cockpit persistence is `global` or `repo`.
@@ -91,7 +92,7 @@ Antiphon keeps an explicit active workspace instead of assuming the process cwd 
 
 Each repo can use one of two persistence scopes:
 
-- `global`: settings and conversations stay under the Antiphon runtime home
+- `global`: settings and conversations stay under the A N T I P H O N runtime home
 - `repo`: settings and conversations live under `<repo>/.antiphon/`
 
 You can also start directly in a repo from the CLI:
